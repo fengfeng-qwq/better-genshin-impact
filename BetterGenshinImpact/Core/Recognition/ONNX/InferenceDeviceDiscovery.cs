@@ -13,8 +13,11 @@ public interface IInferenceDeviceDiscovery
     IReadOnlyList<InferenceDeviceInfo> GetDevices(InferenceDeviceType engine, string runtimeDirectory);
 }
 
-/// <summary>DirectML 候选适配器；IsPciAdapter 为 false 表示该 DXGI 入口没有有效的 PCI 位置。</summary>
-public sealed record DirectMlAdapterCandidate(string ModelKey, bool IsPciAdapter, InferenceDeviceInfo Device);
+/// <summary>PCI 地址查询结果。Absent 是系统明确回复该入口没有 PCI 位置，Unknown 是没问到结果，两者不能混为一谈。</summary>
+public enum PciAddressState { Confirmed, Absent, Unknown }
+
+/// <summary>DirectML 候选适配器。</summary>
+public sealed record DirectMlAdapterCandidate(string ModelKey, PciAddressState PciAddress, InferenceDeviceInfo Device);
 
 /// <summary>只探测硬件 API，不加载、替换其他引擎的 onnxruntime.dll。</summary>
 public sealed class InferenceDeviceDiscovery : IInferenceDeviceDiscovery
@@ -46,23 +49,24 @@ public sealed class InferenceDeviceDiscovery : IInferenceDeviceDiscovery
                 var result = D3D12CreateDevice(adapter.NativePointer, 0xb000, ref iid, out var device);
                 if (device != IntPtr.Zero) Marshal.Release(device);
                 if (result < 0) continue;
-                var (id, isPciAdapter) = GetDirectMlIdentity(description);
+                var (id, pciAddress) = GetDirectMlIdentity(description);
                 var deviceInfo = new InferenceDeviceInfo(id, description.Description.Trim(), index, index.ToString());
-                candidates.Add(new($"{description.VendorId:X4}:{description.DeviceId:X4}", isPciAdapter, deviceInfo));
+                candidates.Add(new($"{description.VendorId:X4}:{description.DeviceId:X4}", pciAddress, deviceInfo));
             }
         }
         return NormalizeDirectMlDevices(FilterVirtualAdapterDuplicates(candidates));
     }
 
-    // 虚拟显示器的间接显示驱动会为同一块物理显卡多报非 PCI 入口，它们的 PCI 地址都是无效值，按身份去重后仍会残留一个。
-    // 整机没有 PCI 显卡时（虚拟机 GPU 直通）必须全部保留，否则设备列表会空掉。
+    // 虚拟显示器的间接显示驱动会为同一块物理显卡多报入口，系统对这些入口明确回复没有 PCI 位置，按身份去重后仍会残留一个。
+    // 只丢弃这种明确回复、且同型号物理卡已经列出的入口；查询失败的条目一律保留，避免误删真显卡。
     public static IReadOnlyList<InferenceDeviceInfo> FilterVirtualAdapterDuplicates(
         IReadOnlyList<DirectMlAdapterCandidate> candidates)
     {
-        var physicalModels = candidates.Where(candidate => candidate.IsPciAdapter)
+        var physicalModels = candidates.Where(candidate => candidate.PciAddress == PciAddressState.Confirmed)
             .Select(candidate => candidate.ModelKey).ToHashSet();
         return candidates
-            .Where(candidate => candidate.IsPciAdapter || !physicalModels.Contains(candidate.ModelKey))
+            .Where(candidate => candidate.PciAddress != PciAddressState.Absent
+                                || !physicalModels.Contains(candidate.ModelKey))
             .Select(candidate => candidate.Device).ToArray();
     }
 
@@ -74,7 +78,7 @@ public sealed class InferenceDeviceDiscovery : IInferenceDeviceDiscovery
             ? device with { Name = $"{device.Name}（设备 {device.Index + 1}）" } : device).ToArray();
     }
 
-    private static (string Id, bool IsPciAdapter) GetDirectMlIdentity(AdapterDescription1 description)
+    private static (string Id, PciAddressState PciAddress) GetDirectMlIdentity(AdapterDescription1 description)
     {
         // LUID 只在一次 Windows 启动期间稳定，持久化时改用显卡的 PCI 位置和型号。
         var adapter = new KernelAdapter { Luid = description.Luid };
@@ -88,8 +92,8 @@ public sealed class InferenceDeviceDiscovery : IInferenceDeviceDiscovery
                 {
                     var address = Marshal.PtrToStructure<AdapterAddress>(buffer);
                     var id = $"DXGI:{description.VendorId:X4}:{description.DeviceId:X4}:{address.Bus}:{address.Device}:{address.Function}";
-                    // 非 PCI 入口返回全 F 的无效地址，不能当成真实 PCI 位置。
-                    return (id, address.Bus != uint.MaxValue);
+                    // 全 F 是系统明确回复该入口没有 PCI 位置，与查询失败不同，可以据此判定为虚拟入口。
+                    return (id, address.Bus == uint.MaxValue ? PciAddressState.Absent : PciAddressState.Confirmed);
                 }
             }
             finally
@@ -99,8 +103,8 @@ public sealed class InferenceDeviceDiscovery : IInferenceDeviceDiscovery
                 D3DKMTCloseAdapter(ref handle);
             }
         }
-        // 非 PCI 适配器保留型号与 LUID，避免误合并多张同型号显卡。跨启动标识失效时重新选设备。
-        return ($"DXGI:{description.VendorId:X4}:{description.DeviceId:X4}:{description.SubsystemId:X8}:{description.Luid:X16}", false);
+        // 查询不到 PCI 位置的适配器保留型号与 LUID，避免误合并多张同型号显卡。跨启动标识失效时重新选设备。
+        return ($"DXGI:{description.VendorId:X4}:{description.DeviceId:X4}:{description.SubsystemId:X8}:{description.Luid:X16}", PciAddressState.Unknown);
     }
 
     private static IReadOnlyList<InferenceDeviceInfo> GetNvidiaDevices(InferenceDeviceType engine)
