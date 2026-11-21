@@ -23,6 +23,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-nuget-
 
+      - name: Solution Debug build (AGENTS.md 编译验证)
+        run: dotnet msbuild BetterGenshinImpact.sln -restore -p:Configuration=Debug -nologo -tl:off -clp:ErrorsOnly
+
       - name: Unit tests (InferenceDeviceDiscovery)
         run: dotnet test Test/BetterGenshinImpact.UnitTest/BetterGenshinImpact.UnitTest.csproj -c Release --filter "FullyQualifiedName~InferenceDeviceDiscoveryTests" --logger "console;verbosity=detailed"
 
